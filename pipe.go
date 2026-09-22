@@ -2,39 +2,78 @@ package retrydedupe
 
 import "bytes"
 
-// Handle is the public entry: retry + dedupe + ledger in one function.
+// Handle is the public entry. Wire format is unchanged: requests go to
+// down verbatim, completed entries come out verbatim in request order.
 func Handle(reqs [][]byte, down func([]byte) ([]byte, error)) ([][]byte, error) {
-	seen := map[string]bool{}
-	var out [][]byte
+	d := newDedupe()
+	l := &ledger{}
 	for _, req := range reqs {
-		key := string(req)
-		// BUG: dedupe by full bytes so "alike" new orders with shared prefix can be swallowed if truncated compare
-		if len(key) > 2 {
-			key = key[:2]
-		}
-		if seen[key] {
+		if d.seen(req) {
 			continue
 		}
-		var last []byte
-		var err error
-		for try := 0; try < 3; try++ {
-			last, err = down(req)
-			if err == nil {
-				break
-			}
-			// BUG: on jitter, re-exec even if previous try already produced a full ledger entry
-		}
-		if err != nil {
-			// BUG: half response still advances and skips later good seq
-			if last != nil {
-				out = append(out, last)
-			}
+		entry, ok := fetch(req, down)
+		if !ok {
+			// never committed: not marked seen, later duplicate may retry
 			continue
 		}
-		seen[key] = true
-		out = append(out, last)
+		d.mark(req)
+		l.add(entry)
 	}
-	return out, nil
+	return l.entries, nil
+}
+
+const maxTries = 3
+
+// fetch computes one order. It retries only when downstream gave nothing
+// usable back; a full entry is accepted even when its call reported jitter,
+// so an already-committed order is never executed twice. Half replies are
+// dropped and never reach the ledger.
+func fetch(req []byte, down func([]byte) ([]byte, error)) ([]byte, bool) {
+	for try := 0; try < maxTries; try++ {
+		resp, err := down(req)
+		if err == nil {
+			return resp, true
+		}
+		if isFullEntry(req, resp) {
+			// jitter after the entry was committed: keep it, do not re-execute
+			return resp, true
+		}
+		// half reply: drop it and try again
+	}
+	return nil, false
+}
+
+// isFullEntry reports whether resp carries the complete order back.
+func isFullEntry(req, resp []byte) bool {
+	return len(resp) > 0 && bytes.Contains(resp, req)
+}
+
+// dedupe tracks orders already computed, keyed by the full request bytes,
+// so a new order that merely shares a prefix is never swallowed.
+type dedupe struct {
+	done map[string]struct{}
+}
+
+func newDedupe() *dedupe {
+	return &dedupe{done: map[string]struct{}{}}
+}
+
+func (d *dedupe) seen(req []byte) bool {
+	_, ok := d.done[string(req)]
+	return ok
+}
+
+func (d *dedupe) mark(req []byte) {
+	d.done[string(req)] = struct{}{}
+}
+
+// ledger keeps completed entries in their original request order.
+type ledger struct {
+	entries [][]byte
+}
+
+func (l *ledger) add(entry []byte) {
+	l.entries = append(l.entries, entry)
 }
 
 func DecodeSeq(b []byte) int {
